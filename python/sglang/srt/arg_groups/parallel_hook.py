@@ -162,12 +162,12 @@ def handle_dcp_validation(server_args: Any):
     # Resolve the decode backend the way the model overrides do: gating on
     # cfg.attention_backend alone misses --decode-attention-backend aiter.
     if cfg.dcp_size > 1 and get_platform().is_hip:
-        prefill_backend, decode_backend = attention_backends_of(cfg)
+        _, decode_backend = attention_backends_of(cfg)
         if decode_backend == "aiter":
-            _validate_aiter_mla_dcp(server_args, prefill_backend=prefill_backend)
+            _validate_aiter_mla_dcp(server_args)
 
 
-def _validate_aiter_mla_dcp(server_args: Any, *, prefill_backend: str | None = None):
+def _validate_aiter_mla_dcp(server_args: Any):
     """Validate aiter MLA decode-context-parallel (--dcp-size > 1)."""
     from sglang.srt.configs.model_config import AttentionArch
 
@@ -175,16 +175,6 @@ def _validate_aiter_mla_dcp(server_args: Any, *, prefill_backend: str | None = N
     model_config = model_config_of(server_args)
     if model_config.attention_arch != AttentionArch.MLA:
         return
-
-    # TEMPORARY, lifted by the triton-MLA-DCP fix later in this series:
-    # that path double-filters its MLA KV writes under DCP, silently.
-    if prefill_backend == "triton":
-        raise ValueError(
-            "--prefill-attention-backend triton is not yet supported "
-            "together with the aiter MLA DCP decode path (--dcp-size > 1): "
-            "the triton extend path corrupts its MLA KV writes under DCP. "
-            "Use the default aiter prefill backend."
-        )
 
     if "fp8" in (cfg.kv_cache_dtype or "") and not (
         envs.SGLANG_EXPERIMENTAL_AITER_DCP_FP8.get()
