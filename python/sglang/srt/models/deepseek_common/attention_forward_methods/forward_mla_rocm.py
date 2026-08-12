@@ -269,6 +269,13 @@ def _fused_rope_cat_and_cache(
     kv_cache_dtype = (
         fp8_dtype if attn.kv_cache_dtype == "fp8_e4m3" else q_nope_out.dtype
     )
+    # Gluon MLA decode (bh16bn128) requires bf16 Q; vLLM #50563.
+    q_out_dtype = (
+        q_nope_out.dtype
+        if attn.kv_cache_dtype == "fp8_e4m3"
+        and attn.current_attention_backend == "aiter"
+        else kv_cache_dtype
+    )
     return fused_qk_rope_cat_and_cache_mla(
         q_nope_out,
         q_pe,
@@ -281,7 +288,7 @@ def _fused_rope_cat_and_cache(
         attn.rotary_emb.sin_cache,
         attn.attn_mqa.k_scale,
         attn.rotary_emb.is_neox_style,
-        q_out_dtype=kv_cache_dtype,
+        q_out_dtype=q_out_dtype,
     )
 
 
@@ -847,7 +854,7 @@ class DeepseekMLARocmForwardMixin:
         forward_absorb_rocm_core that calls fused_qk_rope_cat_and_cache_mla).
         """
         # NoPE models (rotary_emb=None, e.g. Kimi-K3) have no rope for the
-        # fused kernel to apply and no cos/sin cache to pass to it.
+        # fused kernel to apply; keep both prepare and core on the plain path.
         return (
             self.rotary_emb is not None
             and _use_aiter_gfx95
