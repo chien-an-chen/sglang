@@ -1467,10 +1467,18 @@ class GroupCoordinator:
         # Bypass the function if we are using only 1 GPU.
         if self.world_size == 1:
             return input_
-        # Broadcast.
-        torch.distributed.broadcast(
-            input_, src=self.ranks[src], group=self.device_group
-        )
+        # Broadcast. A torch.distributed broadcast registers a WorkNCCL whose
+        # end event the ProcessGroupNCCL watchdog polls, which is illegal for an
+        # event recorded in a capturing stream. Speculative TP sync broadcasts
+        # from inside the draft-verify graph, so prefer pynccl, which
+        # graph_capture() enables exactly for this.
+        pynccl_comm = self.pynccl_comm
+        if pynccl_comm is not None and not pynccl_comm.disabled and input_.is_cuda:
+            pynccl_comm.broadcast(input_, src=src)
+        else:
+            torch.distributed.broadcast(
+                input_, src=self.ranks[src], group=self.device_group
+            )
         return input_
 
     def broadcast_object(self, obj: Optional[Any] = None, src: int = 0):
