@@ -155,6 +155,11 @@ def mla_gluon_available() -> bool:
         return False
 
 
+def _gluon_fn():
+    """PR #34432 DCP still `import _gluon_fn`; this tree renamed the loader."""
+    return _mla_gluon_fn if mla_gluon_available() else None
+
+
 def mla_gluon_decode(
     *,
     q: torch.Tensor,
