@@ -162,29 +162,41 @@ def mla_gluon_decode(
     layer: RadixAttention,
     kv_indices: torch.Tensor,
     kv_indptr: torch.Tensor,
-    seq_lens: torch.Tensor,
     sm_scale: float,
+    seq_lens: Optional[torch.Tensor] = None,
     kv_scale: float = 1.0,
     min_kv_seq_len: Optional[int] = None,
-) -> Optional[torch.Tensor]:
-    """Run Gluon MLA decode for fused Q [B, H, 576] and MLA KV pool.
+    qlen: int = 1,
+    use_2d_view: bool = False,
+    return_lse: bool = False,
+):
+    """Run Gluon MLA decode for fused Q and MLA KV pool.
 
-    Returns output [B, H, v_head_dim] on success, or None to fall back.
+    Plain decode: ``q`` is ``[B, H, 576]`` (``qlen=1``) and the return is
+    ``[B, H, v_head_dim]``. Target-verify / DCP MTP: ``qlen > 1`` uses a 4-D
+    kernel view and flattens back to ``[num_tokens, H, v]``. ``return_lse=True``
+    (DCP merge) returns ``(out, lse)``. Returns ``None`` to fall back, except
+    ``return_lse`` re-raises — DCP cannot drop the LSE.
 
-    ``min_kv_seq_len`` must be supplied by the caller during CUDA graph capture
-    (no GPU->CPU sync from ``seq_lens``). For eager decode, omit it to derive
-    from ``seq_lens`` when safe.
+    ``min_kv_seq_len`` must be supplied during CUDA graph capture (no GPU->CPU
+    sync from ``seq_lens``). For eager decode, omit it to derive from
+    ``seq_lens`` when present.
     """
     if not mla_gluon_available():
         return None
 
-    batch_size = q.shape[0]
-
+    num_head = layer.tp_q_head_num
     kv_lora_rank = layer.v_head_dim
     qk_rope_head_dim = layer.qk_head_dim - kv_lora_rank
-    q_nope, q_pe = torch.split(q, [kv_lora_rank, qk_rope_head_dim], dim=-1)
+    batch_size = q.shape[0] // qlen
 
-    o = q.new_empty((batch_size, layer.tp_q_head_num, kv_lora_rank))
+    q_nope, q_pe = torch.split(q, [kv_lora_rank, qk_rope_head_dim], dim=-1)
+    if qlen > 1:
+        q_nope = q_nope.view(batch_size, qlen, num_head, kv_lora_rank)
+        q_pe = q_pe.view(batch_size, qlen, num_head, qk_rope_head_dim)
+        o = q.new_empty((batch_size, qlen, num_head, kv_lora_rank))
+    else:
+        o = q.new_empty((batch_size, num_head, kv_lora_rank))
 
     kv_c = k_buffer.view(-1, layer.qk_head_dim)
     if min_kv_seq_len is None:
@@ -193,13 +205,21 @@ def mla_gluon_decode(
                 "mla_gluon_decode: min_kv_seq_len missing during CUDA graph capture"
             )
             min_kv_seq_len = 1
-        elif seq_lens.numel():
+        elif seq_lens is not None and seq_lens.numel():
             min_kv_seq_len = int(seq_lens.max().item())
         else:
             min_kv_seq_len = 1
 
+    extra_kwargs = {
+        "use_2d_view": use_2d_view,
+        "kv_scale": kv_scale,
+        "min_kv_seq_len": min_kv_seq_len,
+    }
+    if return_lse:
+        extra_kwargs["return_lse"] = True
+
     try:
-        _mla_gluon_fn(
+        result = _mla_gluon_fn(
             q_nope,
             q_pe,
             kv_c,
@@ -209,12 +229,16 @@ def mla_gluon_decode(
             sm_scale,
             k_pe=None,
             kv_pe_offset=kv_lora_rank,
-            use_2d_view=False,
-            kv_scale=kv_scale,
-            min_kv_seq_len=min_kv_seq_len,
+            **extra_kwargs,
         )
-        return o
+        out = o.flatten(0, 1) if qlen > 1 else o
+        if not return_lse:
+            return out
+        _, lse = result
+        return out, lse
     except Exception as exc:
+        if return_lse:
+            raise
         logger.warning(
             "mla_gluon decode failed (num_head=%s, kv_dtype=%s, batch=%s): %s; "
             "falling back to zero-pad mla_decode_fwd",
