@@ -107,6 +107,28 @@ def free_swa_out_of_window_slots(
         req.kv.swa_evicted_seqlen = new_swa_evicted_seqlen
 
 
+
+def coalesce_half_open_ranges(
+    ranges: list[tuple[int, int]],
+) -> list[tuple[int, int]]:
+    """Merge overlapping or abutting half-open ``[start, end)`` ranges.
+
+    Under DCP the free surface is ``page_size * dcp_size``. Adjacent ranges
+    with ``start == prev_end`` then fail ``_page_disjoint``.
+    """
+    items = sorted((start, end) for start, end in ranges if end > start)
+    if not items:
+        return []
+    merged: list[tuple[int, int]] = [items[0]]
+    for start, end in items[1:]:
+        prev_start, prev_end = merged[-1]
+        if start <= prev_end:
+            merged[-1] = (prev_start, max(prev_end, end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
 def free_kv_row_segments(
     allocator: BaseTokenToKVPoolAllocator,
     segments: list[tuple[torch.Tensor, int]],

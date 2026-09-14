@@ -43,9 +43,10 @@ def _require_kimi_k3_cutedsl_dcp_support() -> None:
 
 
 def _require_kimi_k3_aiter_gluon_dcp_support() -> None:
-    from sglang.srt.layers.attention.aiter_mla_gluon import _gluon_fn
+    # yuyun tree renamed _gluon_fn -> mla_gluon_available / _mla_gluon_fn.
+    from sglang.srt.layers.attention.aiter_mla_gluon import mla_gluon_available
 
-    if _gluon_fn() is None:
+    if not mla_gluon_available():
         raise RuntimeError(
             "Kimi-K3 DCP with decode_attention_backend='aiter' requires the aiter "
             "gluon mla kernel, which is unavailable. See above aborting reasons."

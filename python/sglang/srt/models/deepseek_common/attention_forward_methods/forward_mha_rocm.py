@@ -37,6 +37,23 @@ from sglang.srt.utils import BumpAllocator, get_bool_env_var
 if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 
+_log_mha_k_shape = get_bool_env_var("SGLANG_LOG_MHA_K_SHAPE", "false")
+_mha_k_shapes_logged: set[tuple] = set()
+
+
+def _maybe_log_mha_k_shape(k_shape, k_nope) -> None:
+    key = (int(k_shape[0]), int(k_shape[1]), int(k_shape[2]), str(k_nope.dtype))
+    if key in _mha_k_shapes_logged or len(_mha_k_shapes_logged) >= 64:
+        return
+    _mha_k_shapes_logged.add(key)
+    nbytes = k_nope.element_size() * key[0] * key[1] * key[2]
+    print(
+        f"[mha_k_shape] T={key[0]} H={key[1]} D={key[2]} dtype={key[3]} "
+        f"{nbytes / 1024**2:.2f} MiB n_unique={len(_mha_k_shapes_logged)}",
+        flush=True,
+    )
+
+
 _use_fp8_prefill_attn = (
     get_bool_env_var("SGLANG_AITER_FP8_PREFILL_ATTN", "True") and _use_aiter_gfx95
 )
@@ -282,6 +299,8 @@ class DeepseekMHARocmForwardMixin:
         k_pe: torch.Tensor,
     ):
         k_shape = (k_nope.shape[0], self.num_local_heads, self.qk_head_dim)
+        if _log_mha_k_shape:
+            _maybe_log_mha_k_shape(k_shape, k_nope)
         k = k_nope.new_empty(*k_shape)
         if self.current_attention_backend == "aiter":
             concat_and_cast_mha_k_triton(k, k_nope, k_pe)
