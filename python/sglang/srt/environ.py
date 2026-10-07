@@ -1832,6 +1832,12 @@ class Envs:
     SGLANG_K3_FUSED_FRONT = EnvBool(True)
     # Use the ROCm radix-4 router for covered K3 top-k workloads.
     SGLANG_K3_RADIX4_TOPK = EnvBool(False)
+    # Where the K3 FlyDSL kernels come from: "auto" prefers the SGLang copy and
+    # falls back to AITER, "sglang" and "aiter" pin one source.
+    SGLANG_ROCM_K3_FLYDSL_SOURCE = EnvStr("auto")
+    # Set to "aiter" to defer the KDA f_b projection into AITER's fused gfx950
+    # decode kernel instead of running it as a separate GEMM.
+    SGLANG_ROCM_K3_KDA_FUSED_BACKEND = EnvStr("")
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MIN_HITS = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MAX_SEQLEN = EnvInt(6144)
