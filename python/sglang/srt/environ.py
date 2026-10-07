@@ -1845,12 +1845,18 @@ class Envs:
     SGLANG_ROCM_K3_AITER_KDA_GROUP64 = EnvBool(False)
     SGLANG_ROCM_K3_AITER_MOE_PREROUTE_FP8 = EnvBool(False)
     SGLANG_ROCM_K3_AITER_LATENT_TAIL_FP8 = EnvBool(False)
+    # Extend the KDA and MoE pre-route fusions from the single-token bucket to
+    # two tokens.
+    SGLANG_ROCM_K3_AITER_B2_FUSIONS = EnvBool(False)
     # Where the K3 FlyDSL kernels come from: "auto" prefers the SGLang copy and
     # falls back to AITER, "sglang" and "aiter" pin one source.
     SGLANG_ROCM_K3_FLYDSL_SOURCE = EnvStr("auto")
     # Set to "aiter" to defer the KDA f_b projection into AITER's fused gfx950
     # decode kernel instead of running it as a separate GEMM.
     SGLANG_ROCM_K3_KDA_FUSED_BACKEND = EnvStr("")
+    # Restore the pre-tuning (rows_per_wave, weight_cache_modifier) pair for
+    # the KDA group64 projection so the per-bucket tuning can be A/B'd.
+    SGLANG_ROCM_K3_KDA_GROUP64_LEGACY_LAUNCH = EnvBool(False)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MIN_HITS = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MAX_SEQLEN = EnvInt(6144)
