@@ -137,7 +137,7 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
         MuseGlimmerConfig,
         MuseGlimmerAssistantConfig,
         K3DSparkConfig,
-    KimiK3Config,
+        KimiK3Config,
         Glm5NextConfig,
         Glm5NextTextConfig,
         KimiLinearConfig,
