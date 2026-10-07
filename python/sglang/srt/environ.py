@@ -1816,6 +1816,24 @@ class Envs:
     # CustomAllReduceV2 with multicast is available; set 0/1 to override in
     # either direction. See srt/layers/communication/k3_ar_fusion.py.
     SGLANG_K3_AR_FUSION = EnvBool(False)
+    # HIP: fuse the K3 latent all-reduce with RMSNorm via AITER's 2-stage
+    # kernel. Only applies when the combined buffer is already in the 2-stage
+    # AR regime (>= 80 KiB on TP8); smaller sizes stay on split AR + RMSNorm.
+    SGLANG_ROCM_K3_FUSED_AR_RMSNORM = EnvBool(True)
+    # Upper token bound for the fused AR+RMSNorm above; 0 disables the cap.
+    # Measured on MI355X TP8 (bench_fused_ar_rmsnorm.py): fused wins by 5.3% at
+    # 8 tokens, 2.5% at 24, then loses 2.8% at 32 and 13% at 96.
+    SGLANG_ROCM_K3_FUSED_AR_RMSNORM_MAX_TOKENS = EnvInt(24)
+    # HIP: when the fused-front [latent | shared] buffer is larger than the
+    # quick-reduce IPC cap, all-reduce the two slices separately instead of
+    # one NCCL Generic. Keeps ROCM_QUICK_REDUCE_MAX_SIZE_BYTES_MB=256 (16K
+    # scratch). Decode-sized concatenations stay on a single collective.
+    SGLANG_ROCM_K3_SPLIT_OVERSIZED_MOE_AR = EnvBool(True)
+    # HIP: fold the K3 attn-res prefix add into AITER custom all-reduce.
+    # M in {1,2,4} uses 1-stage; M=8 uses a 2-stage residual epilogue that
+    # folds the add into all-gather. Set MAX_TOKENS=4 for the old policy.
+    SGLANG_ROCM_K3_AR_RESIDUAL = EnvBool(True)
+    SGLANG_ROCM_K3_AR_RESIDUAL_MAX_TOKENS = EnvInt(8)
     # K3 SP-MoE fused residual + reduce-scatter and matching all-gather over
     # CustomAllReduceV2's MNNVL push workspace. Auto-probed for checked-in
     # TP4/TP8 GB300 and TP16 GB200/GB300 tuning; set 0/1 to override. See
