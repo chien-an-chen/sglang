@@ -936,9 +936,9 @@ class Envs:
     # Enable dual-stream MoE (shared experts vs routed experts) on the
     # ROCm/AITER path. Requires GPU_MAX_HW_QUEUES>=5 to avoid HW-queue serialization.
     SGLANG_ROCM_USE_MULTI_STREAM = EnvBool(False)
-    # Fold the KDA [f_a|b] tail into the wide [q,k,v,g] projection so the whole
-    # in-proj is one GEMM. Decode is bandwidth bound there, so the 144 extra
-    # output columns ride along nearly free.
+    # Fold the Kimi-K3 KDA [f_a|b] tail into the wide [q,k,v,g] projection.
+    # The merged N=6288 shape is used only up to MAX_TOKENS below, where decode
+    # is bandwidth bound; larger batches keep the tuned N=6144 split path.
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ = EnvBool(True)
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ_MAX_TOKENS = EnvInt(256)
     # Activation precision for MXFP4-weight dense linears, independent of the
@@ -1856,6 +1856,65 @@ class Envs:
     SGLANG_K3_RADIX4_TOPK = EnvBool(False)
     # Fold the BM=16 MoE sort into the radix-4 launch for decode-sized M.
     SGLANG_ROCM_K3_RADIX4_FUSE_SORT = EnvBool(True)
+    # Route Kimi-K3's non-EP merged BF16 MoE front through AITER tuned_gemm.
+    # Gated separately from latent MXFP4 so either can be measured alone.
+    SGLANG_ROCM_K3_AITER_TUNED_MOE_FRONT = EnvBool(False)
+    SGLANG_ROCM_K3_AITER_TUNED_MOE_FRONT_MIN_TOKENS = EnvInt(48)
+    SGLANG_ROCM_K3_AITER_TUNED_MOE_FRONT_MAX_TOKENS = EnvInt(192)
+    # Keep packed MXFP4 copies of the non-EP latent down/up projections and use
+    # them only for large token batches. BF16 weights remain live as fallback.
+    SGLANG_ROCM_K3_MOE_LATENT_MXFP4 = EnvBool(False)
+    SGLANG_ROCM_K3_MOE_LATENT_MXFP4_MIN_TOKENS = EnvInt(2048)
+    # The same structural split as MOE_LATENT_MXFP4 -- run the fused front's
+    # router head as its own small BF16 GEMM so the 3584x7168 latent
+    # down-projection beside it can be quantized -- but in PTPC FP8 rather than
+    # MXFP4, and from decode-sized batches rather than only from 2048 tokens.
+    # MXFP4 is a quarter of the bytes but costs GSM8K 0.951 -> 0.923 on these
+    # two projections; e4m3 keeps a per-channel scale over 7168 values where
+    # MXFP4 keeps 4 bits and a shared exponent per 32.
+    SGLANG_ROCM_K3_MOE_LATENT_FP8 = EnvBool(False)
+    # Defaults to the PTPC FP8 batch floor below, which is where the
+    # activation-quant launch starts paying for itself.
+    SGLANG_ROCM_K3_MOE_LATENT_FP8_MIN_TOKENS = EnvInt(8)
+    # PTPC FP8 (per-token activation, per-channel weight) for the BF16 decode
+    # projections the checkpoint leaves unquantized, halving the weight bytes
+    # those HBM-bound GEMMs stream. The router gate must stay BF16: FP8 logits
+    # move the top-k selection.
+    SGLANG_ROCM_K3_PTPC_FP8 = EnvBool(False)
+    SGLANG_ROCM_K3_PTPC_FP8_MAX_TOKENS = EnvInt(256)
+    # Also take the PTPC FP8 latent-up / shared-down GEMMs from this many tokens
+    # up (0 = never). Between the decode cap and ~4K tokens BF16 hipBLASLt is
+    # faster; at an 8192-token prefill chunk FP8 is 1.8x on latent up
+    # [3584 -> 7168] and 1.4x on shared down [768 -> 7168] on MI355X.
+    SGLANG_ROCM_K3_PTPC_FP8_PREFILL_MIN_TOKENS = EnvInt(0)
+    SGLANG_ROCM_K3_PTPC_FP8_SHARED_DOWN = EnvBool(False)
+    # Dequantize Quark MXFP4 shared experts before the MoE front merge so they
+    # join the full fused front and the PTPC shared-down path (needs
+    # SGLANG_ROCM_QUARK_MXFP4_LINEAR_ACT=bf16).
+    SGLANG_ROCM_K3_QUARK_SHARED_FULL_FRONT = EnvBool(False)
+    # Below this batch the projections are launch-latency bound, so the extra
+    # activation-quant launch costs more than the halved weight traffic saves.
+    SGLANG_ROCM_K3_PTPC_FP8_MIN_TOKENS = EnvInt(8)
+    # Quantize the linears an unquantized K3 checkpoint leaves dense to
+    # per-output-channel FP8 after load, giving them the same layout a Quark
+    # export ships so the PTPC paths above can serve them.
+    # The attention block minus the KDA input projection: both o_projs, the MLA
+    # gate and the MLA q/kv projections.
+    SGLANG_ROCM_K3_ONLINE_FP8_ATTN = EnvBool(False)
+    # The KDA input projection, the largest dense block in the model, but one
+    # decode already reads through the group-64 AITER pack
+    # (SGLANG_ROCM_K3_AITER_KDA_GROUP64) while it is BF16. Quantizing it trades
+    # that kernel for an FP8 prefill GEMM plus the merged PTPC decode GEMM, so
+    # it is gated separately.
+    SGLANG_ROCM_K3_ONLINE_FP8_KDA_INPROJ = EnvBool(False)
+    # The shared-expert gate/up projections. The shared-expert down projection
+    # is never converted here -- K3 consumes it as a raw dense [out, in] tensor
+    # outside quant_method -- use SGLANG_ROCM_K3_PTPC_FP8_SHARED_DOWN instead,
+    # which packs a separate FP8 copy and leaves the BF16 weight live.
+    SGLANG_ROCM_K3_ONLINE_FP8_SHARED_EXPERTS = EnvBool(False)
+    # Master switch for the ROCm AITER K3 decode path: the MXFP4 SiTU MoE
+    # runner, the fused MoE front and the AITER-backed attention projections.
+    SGLANG_ROCM_K3_AITER_OPT = EnvBool(False)
     # Per-operator opt-ins for the gfx950 FlyDSL specializations. Each one
     # fail-closes to the split GEMM chain when the chip, shape or AITER build
     # cannot service it, so enabling one on unsupported hardware is a no-op.
@@ -1884,6 +1943,12 @@ class Envs:
     # Restore the pre-tuning (rows_per_wave, weight_cache_modifier) pair for
     # the KDA group64 projection so the per-bucket tuning can be A/B'd.
     SGLANG_ROCM_K3_KDA_GROUP64_LEGACY_LAUNCH = EnvBool(False)
+    # Use the per-bank-depth num_warps / waves_per_eu for the ROCm
+    # attention-residual kernels; set 0 for the untuned launch.
+    SGLANG_ROCM_K3_ATTN_RES_TUNED_LAUNCH = EnvBool(True)
+    # Prepend an SGLang-shipped BF16 tuned-GEMM profile for M=16384 to AITER's
+    # config search path. Read before any import can initialize AITER_CONFIGS.
+    SGLANG_ROCM_K3_AITER_M16384_PROFILE = EnvBool(False)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MIN_HITS = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MAX_SEQLEN = EnvInt(6144)
