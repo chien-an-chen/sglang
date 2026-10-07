@@ -530,10 +530,6 @@ class DSparkWorkerV2(BaseSpecWorker):
         if not self._hosts_draft:
             return
         capture_decode_cuda_graph = self._decode_graph_allowed
-        # The bs=32 draft graph captures, then faults on the first real
-        # proposal. Run this draft eagerly until that replay is fixed.
-        if getattr(self, "_draft_mla_no_dcp", False):
-            capture_decode_cuda_graph = False
         available_mem = self._tp_sync.available_memory_gb(
             SpecTpSyncSite.DSPARK_MEM,
             self.device,
@@ -565,10 +561,12 @@ class DSparkWorkerV2(BaseSpecWorker):
                             make_draft_sampler_capture_hook(self._draft_sampler)
                         )
                 self._proposer.attach_draft_sampler(self._draft_sampler)
-            # The persistent qh16/qseqlen4 kernel faults on the odd decode
-            # buckets (bs=30 was the first). Capture only bs=32 for this draft.
-            # The target keeps the full bucket list so a one-request verify
-            # replays its own graph instead of padding into the mamba buffer.
+            # The persistent qh16/qseqlen4 kernel faults on odd decode buckets
+            # (bs=30 was the first). Capture only bs=32; smaller batches pad up
+            # to that even bucket. qlen 3 is zero-padded to 4 inside attention
+            # so replay does not read a fourth query row or KV page. The target
+            # keeps the full bucket list so a one-request verify replays its
+            # own graph instead of padding into the mamba buffer.
             decode_cfg = get_exec().graph.cuda_graph_config.decode
             saved_bs = decode_cfg.bs
             narrow = bool(getattr(self, "_draft_mla_no_dcp", False)) and bool(
