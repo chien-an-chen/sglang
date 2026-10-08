@@ -1458,7 +1458,25 @@ class AiterAttnBackend(AttentionBackend):
         if self.head_pad_mode == "repeat" or (
             self.head_pad_mode == "none" and self.num_head_padded != self.num_head
         ):
-            q_in = self.pad_heads(q, self.num_head_padded)
+            # K3 draft is 8 heads. Repeat to 16 so aiter stays on the qh16
+            # qseqlen4 tile. Quantize Q with the scale the kernel uses to
+            # dequantize it; bf16 Q would select the a16w8 kernel instead.
+            q_for_pad = q
+            if (
+                self.head_pad_mode == "repeat"
+                and self.use_mla_ps_kernel
+                and self.kv_cache_dtype == fp8_dtype
+                and q.dtype != fp8_dtype
+            ):
+                if kwargs.get("q_scale") is None:
+                    kwargs["q_scale"] = self.k_scale
+                num_tokens = q.shape[0]
+                q_fp8, _ = scaled_fp8_quant(
+                    q.reshape(num_tokens, -1), kwargs["q_scale"]
+                )
+                q_for_pad = q_fp8.view(num_tokens, q.shape[1], layer.qk_head_dim)
+                k_buffer_flat[0].zero_()
+            q_in = self.pad_heads(q_for_pad, self.num_head_padded)
             o = q.new_empty(
                 (q.shape[0], self.num_head_padded, layer.v_head_dim),
                 dtype=self.input_dtype,
