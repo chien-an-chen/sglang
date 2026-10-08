@@ -561,26 +561,13 @@ class DSparkWorkerV2(BaseSpecWorker):
                             make_draft_sampler_capture_hook(self._draft_sampler)
                         )
                 self._proposer.attach_draft_sampler(self._draft_sampler)
-            # The persistent qh16/qseqlen4 kernel faults on odd decode buckets
-            # (bs=30 was the first). Capture only bs=32; smaller batches pad up
-            # to that even bucket. qlen 3 is zero-padded to 4 inside attention
-            # so replay does not read a fourth query row or KV page. The target
-            # keeps the full bucket list so a one-request verify replays its
-            # own graph instead of padding into the mamba buffer.
-            decode_cfg = get_exec().graph.cuda_graph_config.decode
-            saved_bs = decode_cfg.bs
-            narrow = bool(getattr(self, "_draft_mla_no_dcp", False)) and bool(
-                saved_bs
+            # Capture the configured bucket list, the same way ATOM captures
+            # 1..N. A bs=8 draft then replays the bs=8 graph. Padding every
+            # batch up to 32 runs the persistent qh16 kernel at 4x the width.
+            # qlen 3 is still zero-padded to 4 inside attention.
+            self._draft_worker.init_cuda_graphs(
+                capture_decode_cuda_graph=capture_decode_cuda_graph
             )
-            if narrow:
-                decode_cfg.bs = [32] if 32 in list(saved_bs) else [max(saved_bs)]
-            try:
-                self._draft_worker.init_cuda_graphs(
-                    capture_decode_cuda_graph=capture_decode_cuda_graph
-                )
-            finally:
-                if narrow:
-                    decode_cfg.bs = saved_bs
 
     def _maybe_build_draft_sampler(self, *, available_memory_gb: float):
         return maybe_build_draft_sampler(
