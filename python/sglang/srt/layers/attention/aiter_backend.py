@@ -3950,15 +3950,28 @@ class AiterAttnBackend(AttentionBackend):
 
                 num_kv_splits = self.forward_metadata.num_kv_splits
 
+                # _forward_mla_decode zero-pads qlen 3 to the qseqlen4 tile.
+                # This verify branch used to pass the packed qlen-3 tensor
+                # while qo_indptr already steps by 4, so the kernel reads one
+                # row past the allocation. Eager captures hide that inside the
+                # caching allocator; the CUDA-graph pool is exact and faults.
+                max_q_len = self.forward_metadata.max_q_len or 1
+                q_mla = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+                q_mla, real_qlen = self._pad_q_for_qseqlen4(
+                    q_mla, self.forward_metadata.qo_indptr, max_q_len
+                )
+                k_flat = K_Buffer.view(-1, 1, 1, layer.qk_head_dim)
+                if real_qlen is not None:
+                    k_flat[0].zero_()
                 o = self._mla_decode_fwd_with_head_pad(
-                    q,
-                    K_Buffer.view(-1, 1, 1, layer.qk_head_dim),
+                    q_mla,
+                    k_flat,
                     layer,
                     qo_indptr=self.forward_metadata.qo_indptr,
                     kv_indptr=self.forward_metadata.kv_indptr,
                     kv_indices=self.forward_metadata.kv_indices,
                     kv_last_page_lens=self.forward_metadata.kv_last_page_len,
-                    max_seqlen_q=self.forward_metadata.max_q_len,
+                    max_seqlen_q=max_q_len,
                     sm_scale=layer.scaling,
                     logit_cap=layer.logit_cap,
                     work_meta_data=work_metadata,
@@ -3972,6 +3985,11 @@ class AiterAttnBackend(AttentionBackend):
                     intra_batch_mode=intra_batch_mode,
                     num_kv_splits=num_kv_splits,
                 )
+                if real_qlen is not None:
+                    bs = o.shape[0] // max_q_len
+                    o = o.reshape(bs, max_q_len, *o.shape[1:])[:, :real_qlen].reshape(
+                        bs * real_qlen, *o.shape[1:]
+                    )
                 return o
             elif forward_batch.forward_mode.is_draft_extend_v2():
                 work_metadata = self.forward_metadata.work_metadata
