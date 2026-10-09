@@ -383,6 +383,15 @@ class AiterAttnBackend(AttentionBackend):
                 model_runner.model_config.qk_nope_head_dim
                 + model_runner.model_config.qk_rope_head_dim
             )
+            # Absorbed decode Q is kv_lora_rank + rope (576), not qk_nope + rope.
+            kv_lora = getattr(model_runner.model_config, "kv_lora_rank", None)
+            qk_rope = getattr(model_runner.model_config, "qk_rope_head_dim", None)
+            if kv_lora is not None and qk_rope is not None:
+                self.mla_absorb_q_dim = int(kv_lora) + int(qk_rope)
+                self.mla_absorb_v_dim = int(kv_lora)
+            else:
+                self.mla_absorb_q_dim = self.qk_head_dim
+                self.mla_absorb_v_dim = self.v_head_dim
         elif hasattr(model_runner.token_to_kv_pool, "get_v_head_dim"):
             # For hybrid models (Mamba+attention, GDN, Kimi linear),
             # layer_id=0 may not be a full attention layer
@@ -706,10 +715,73 @@ class AiterAttnBackend(AttentionBackend):
             self.fix_max_split_per_batch = self.max_split_per_batch
             self.use_mla_ps_kernel = bool(_use_mla_ps_kernel)
 
+    def _static_rows(
+        self,
+        name: str,
+        rows: int,
+        tail: tuple,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> Optional[torch.Tensor]:
+        """Prefix of a buffer allocated before CUDA-graph capture.
+
+        Replay keeps this address. Allocating inside the draft forward
+        (``repeat`` / ``new_zeros``) breaks that and leaves a GPU bubble
+        between the index kernels and the next GEMM.
+        """
+        buf = getattr(self, name, None)
+        if (
+            not isinstance(buf, torch.Tensor)
+            or buf.dtype != dtype
+            or buf.device != device
+            or buf.shape[0] < rows
+            or tuple(buf.shape[1:]) != tuple(tail)
+        ):
+            return None
+        return buf[:rows]
+
     def pad_heads(self, x: torch.Tensor, padded: int) -> torch.Tensor:
         num_head = x.shape[1]
         reps = -(-padded // num_head)  # ceil(padded / num_head)
-        return x.repeat(1, reps, 1)[:, :padded, :].contiguous()
+        out = None
+        if reps * num_head == padded:
+            out = self._static_rows(
+                "cuda_graph_head_pad",
+                x.shape[0],
+                (padded, x.shape[-1]),
+                x.dtype,
+                x.device,
+            )
+        if out is None:
+            return x.repeat(1, reps, 1)[:, :padded, :].contiguous()
+        for i in range(reps):
+            out[:, i * num_head : (i + 1) * num_head].copy_(x)
+        return out
+
+    def repeat_head_zero_q(
+        self,
+        tokens: int,
+        head_dim: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> Optional[torch.Tensor]:
+        """16-head Q whose extra heads were zeroed before CUDA-graph capture.
+
+        The fused Q writer fills ``[:, :num_head]`` through this buffer's
+        stride. Replay keeps the address, so the 8→16 repeat copy does not
+        run on the draft step.
+        """
+        if getattr(self, "head_pad_mode", None) != "repeat":
+            return None
+        if self.dcp_world_size > 1:
+            return None
+        return self._static_rows(
+            "cuda_graph_q_zero_pad",
+            tokens,
+            (self.num_head_padded, head_dim),
+            dtype,
+            device,
+        )
 
     def check_fp8_prefill_num_head(
         self, *, num_head: int, num_kv_head: int, v_head_dim: int
@@ -1406,9 +1478,50 @@ class AiterAttnBackend(AttentionBackend):
         if q.shape[0] != bs * 3:
             return q, None
         q_rows = q.reshape(bs, 3, *q.shape[1:])
-        padded = q.new_zeros((bs, max_q_len, *q.shape[1:]))
+        out = self._static_rows(
+            "cuda_graph_qseqlen4_q",
+            bs * max_q_len,
+            tuple(q.shape[1:]),
+            q.dtype,
+            q.device,
+        )
+        if out is None:
+            padded = q.new_zeros((bs, max_q_len, *q.shape[1:]))
+            padded[:, :3].copy_(q_rows)
+            return padded.reshape(bs * max_q_len, *q.shape[1:]), 3
+        padded = out.view(bs, max_q_len, *q.shape[1:])
+        padded[:, 3:].zero_()
         padded[:, :3].copy_(q_rows)
-        return padded.reshape(bs * max_q_len, *q.shape[1:]), 3
+        return out, 3
+
+    def _unpad_qseqlen4_out(
+        self,
+        o: torch.Tensor,
+        max_q_len: int,
+        real_qlen: Optional[int],
+    ) -> torch.Tensor:
+        """Copy the real qlen rows into a static buffer.
+
+        ``[:, :real_qlen]`` of a qlen-4 tensor is not contiguous, so a
+        reshape allocates. The static buffer is a different allocation from
+        the attention output, so the copy does not overlap its source.
+        """
+        if real_qlen is None:
+            return o
+        bs = o.shape[0] // max_q_len
+        tail = tuple(o.shape[1:])
+        dst = self._static_rows(
+            "cuda_graph_qseqlen4_out",
+            bs * real_qlen,
+            tail,
+            o.dtype,
+            o.device,
+        )
+        src = o.reshape(bs, max_q_len, *tail)
+        if dst is None:
+            return src[:, :real_qlen].reshape(bs * real_qlen, *tail)
+        dst.view(bs, real_qlen, *tail).copy_(src[:, :real_qlen])
+        return dst
 
     def _set_uniform_qo_indptr(
         self, bs: int, tokens_per_req: int, device: torch.device
@@ -1449,10 +1562,18 @@ class AiterAttnBackend(AttentionBackend):
         # Fused MLA Q may already occupy the 16-head pad buffer (dummy heads
         # zeroed by the producer). Skip Fill(fp8)+float8_copy in that case.
         if q.shape[1] == self.num_head_padded:
-            o = q.new_empty(
-                (q.shape[0], self.num_head_padded, layer.v_head_dim),
-                dtype=self.input_dtype,
+            o = self._static_rows(
+                "cuda_graph_mla_out",
+                q.shape[0],
+                (self.num_head_padded, layer.v_head_dim),
+                self.input_dtype,
+                q.device,
             )
+            if o is None:
+                o = q.new_empty(
+                    (q.shape[0], self.num_head_padded, layer.v_head_dim),
+                    dtype=self.input_dtype,
+                )
             mla_decode_fwd(q, k_buffer_flat, o, **kwargs)
             return o[:, : self.num_head, :]
         if self.head_pad_mode == "repeat" or (
@@ -1477,12 +1598,31 @@ class AiterAttnBackend(AttentionBackend):
                 q_for_pad = q_fp8.view(num_tokens, q.shape[1], layer.qk_head_dim)
                 k_buffer_flat[0].zero_()
             q_in = self.pad_heads(q_for_pad, self.num_head_padded)
-            o = q.new_empty(
-                (q.shape[0], self.num_head_padded, layer.v_head_dim),
-                dtype=self.input_dtype,
+            o = self._static_rows(
+                "cuda_graph_mla_out",
+                q_in.shape[0],
+                (self.num_head_padded, layer.v_head_dim),
+                self.input_dtype,
+                q_in.device,
             )
+            if o is None:
+                o = q.new_empty(
+                    (q.shape[0], self.num_head_padded, layer.v_head_dim),
+                    dtype=self.input_dtype,
+                )
             mla_decode_fwd(q_in, k_buffer_flat, o, **kwargs)
-            return o[:, : self.num_head, :]
+            compact = self._static_rows(
+                "cuda_graph_mla_out_compact",
+                o.shape[0],
+                (self.num_head, layer.v_head_dim),
+                self.input_dtype,
+                o.device,
+            )
+            if compact is None:
+                sliced = o[:, : self.num_head, :]
+                return sliced if sliced.is_contiguous() else sliced.contiguous()
+            compact.copy_(o[:, : self.num_head, :])
+            return compact
         if self.head_pad_mode == "zero":
             q_in = torch.nn.functional.pad(
                 q, (0, 0, 0, self.num_head_padded - num_head)
@@ -1796,12 +1936,7 @@ class AiterAttnBackend(AttentionBackend):
             intra_batch_mode=intra_batch_mode,
             num_kv_splits=num_kv_splits,
         )
-        if real_qlen is None:
-            return o
-        bs = o.shape[0] // max_q_len
-        return o.reshape(bs, max_q_len, *o.shape[1:])[:, :real_qlen].reshape(
-            bs * real_qlen, *o.shape[1:]
-        )
+        return self._unpad_qseqlen4_out(o, max_q_len, real_qlen)
 
     def _get_dcp_graph_max_local_kv_len(self) -> int:
         """Static upper bound on this rank's shard, ceil(max_context_len / W)."""
@@ -2873,6 +3008,55 @@ class AiterAttnBackend(AttentionBackend):
             self.reduce_indptr = None
             self.reduce_final_map = None
             self.reduce_partial_map = None
+
+        # Draft qlen-3 and the 8→16 head pad write these instead of
+        # allocating a new tensor on every layer. Sized for qseqlen4.
+        # Absorbed Q is kv_lora + rope; model qk_head_dim is the pre-absorb
+        # width and does not match the tensor mla_decode_fwd sees.
+        if self.use_mla and getattr(self, "qk_head_dim", None):
+            rows = max(int(max_num_tokens), int(max_bs) * 4)
+            n_head = self.num_head
+            n_head_pad = getattr(self, "num_head_padded", n_head)
+            absorb_q = getattr(self, "mla_absorb_q_dim", self.qk_head_dim)
+            absorb_v = getattr(self, "mla_absorb_v_dim", self.v_head_dim)
+            repeat_heads = getattr(self, "head_pad_mode", None) == "repeat"
+            qseq_heads = n_head_pad if repeat_heads else n_head
+            qseq_dim = absorb_q if repeat_heads else self.qk_head_dim
+            qseq_dtype = fp8_dtype if repeat_heads else self.input_dtype
+            out_v = absorb_v if repeat_heads else self.v_head_dim
+            if repeat_heads:
+                # Dead heads stay zero for the life of the buffer. The fused
+                # writer only fills the real-head slice.
+                self.cuda_graph_q_zero_pad = torch.zeros(
+                    (rows, n_head_pad, absorb_q),
+                    dtype=fp8_dtype,
+                    device=self.device,
+                )
+            self.cuda_graph_qseqlen4_q = torch.empty(
+                (rows, qseq_heads, qseq_dim),
+                dtype=qseq_dtype,
+                device=self.device,
+            )
+            self.cuda_graph_head_pad = torch.empty(
+                (rows, n_head_pad, absorb_q if repeat_heads else self.qk_head_dim),
+                dtype=fp8_dtype,
+                device=self.device,
+            )
+            self.cuda_graph_mla_out = torch.empty(
+                (rows, n_head_pad, out_v),
+                dtype=self.input_dtype,
+                device=self.device,
+            )
+            self.cuda_graph_mla_out_compact = torch.empty(
+                (rows, n_head, out_v),
+                dtype=self.input_dtype,
+                device=self.device,
+            )
+            self.cuda_graph_qseqlen4_out = torch.empty(
+                (rows, n_head, out_v),
+                dtype=self.input_dtype,
+                device=self.device,
+            )
 
         if self.use_sliding_window_kv_pool:
             max_num_blocks_per_seq = (
@@ -3956,7 +4140,10 @@ class AiterAttnBackend(AttentionBackend):
                 # row past the allocation. Eager captures hide that inside the
                 # caching allocator; the CUDA-graph pool is exact and faults.
                 max_q_len = self.forward_metadata.max_q_len or 1
-                q_mla = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+                # A fused writer may already have produced 16 heads. Viewing
+                # that storage as tp_q_head_num interleaves the zero lanes
+                # into the real heads.
+                q_mla = self._mla_q_heads(q, layer)
                 q_mla, real_qlen = self._pad_q_for_qseqlen4(
                     q_mla, self.forward_metadata.qo_indptr, max_q_len
                 )
@@ -3985,12 +4172,7 @@ class AiterAttnBackend(AttentionBackend):
                     intra_batch_mode=intra_batch_mode,
                     num_kv_splits=num_kv_splits,
                 )
-                if real_qlen is not None:
-                    bs = o.shape[0] // max_q_len
-                    o = o.reshape(bs, max_q_len, *o.shape[1:])[:, :real_qlen].reshape(
-                        bs * real_qlen, *o.shape[1:]
-                    )
-                return o
+                return self._unpad_qseqlen4_out(o, max_q_len, real_qlen)
             elif forward_batch.forward_mode.is_draft_extend_v2():
                 work_metadata = self.forward_metadata.work_metadata
                 work_indptr = self.forward_metadata.work_indptr
