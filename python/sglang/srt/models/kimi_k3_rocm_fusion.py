@@ -33,7 +33,7 @@ from sglang.srt.models.deepseek_common.utils_rocm import (
     accepts_group128_fp8_tuple,
     accepts_ptpc_fp8_tuple,
 )
-from sglang.srt.utils import get_bool_env_var, is_hip
+from sglang.srt.utils import is_hip
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +48,7 @@ def _k3_log_once(key: str, msg: str, *args) -> None:
 
 
 _is_hip = is_hip()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 _k3_ptpc_fp8 = _is_hip and envs.SGLANG_ROCM_K3_PTPC_FP8.get()
 _k3_ptpc_fp8_max_tokens = envs.SGLANG_ROCM_K3_PTPC_FP8_MAX_TOKENS.get()
 _k3_ptpc_fp8_min_tokens = envs.SGLANG_ROCM_K3_PTPC_FP8_MIN_TOKENS.get()
@@ -298,3 +298,41 @@ def _k3_fuse_mla_gate_ptpc(x: torch.Tensor, *, gate: torch.Tensor, o_proj: nn.Mo
         return None
     _k3_log_once("mla_gate_ptpc", "K3 MLA o_proj gate+PTPC producer fusion enabled")
     return mla_output_gate_fp8_quant.kimi_k3_mla_output_gate_fp8_quant(x, gate)
+
+
+def try_attn_res_inproj_quant(
+    layer: nn.Module, attn_res, hidden_states, prefix_sum, forward_batch
+):
+    """Attention-side attn-res aggregation feeding a fused RMSNorm+quant in-proj.
+
+    Returns (quantized hidden_states, prefix_sum), or None to take the plain
+    aggregation.
+    """
+    from sglang.srt.layers.attn_residual import can_skip_out_norm
+
+    self_attn = layer.self_attn
+    inproj = _k3_attn_inproj(self_attn)
+    if not (
+        forward_batch.forward_mode.is_decode()
+        and can_skip_out_norm(hidden_states.shape[1], attn_res.num_valid_blocks)
+        and _k3_should_fuse_inproj_quant(
+            self_attn=self_attn, num_tokens=hidden_states.shape[0], inproj=inproj
+        )
+    ):
+        return None
+    hidden_states, prefix_sum = attn_res.forward(
+        hidden_states,
+        prefix_sum,
+        layer.self_attention_res_proj,
+        layer.self_attention_res_norm,
+        layer.input_layernorm,
+        write=layer.is_block_write_layer,
+        skip_out_norm=True,
+    )
+    hidden_states = _k3_maybe_fuse_inproj_quant(
+        hidden_states,
+        rms=layer.input_layernorm,
+        inproj=inproj,
+        self_attn=self_attn,
+    )
+    return hidden_states, prefix_sum

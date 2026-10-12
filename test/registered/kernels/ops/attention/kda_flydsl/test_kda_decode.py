@@ -374,7 +374,7 @@ def test_f_b_batch_two_dispatch_is_guarded() -> None:
 
 
 @pytest.mark.parametrize("batch", [1, 8, 16])
-def test_kimi_k3_kda_decode_matches_reference(batch: int) -> None:
+def test_kda_decode_matches_reference(batch: int) -> None:
     seed = _make_inputs(batch)
     reference_inputs = _copy_inputs(seed)
     actual_inputs = _copy_inputs(seed)
@@ -414,7 +414,7 @@ def test_non_positive_slots_do_not_modify_caches() -> None:
 
 
 @pytest.mark.parametrize("batch", [1, 8, 16])
-def test_kimi_k3_kda_decode_with_f_b_matches_reference(batch: int) -> None:
+def test_kda_decode_with_f_b_matches_reference(batch: int) -> None:
     f_a, f_b_weight, seed = _make_fb_inputs(batch)
     reference_inputs = _copy_inputs(seed)
     actual_inputs = _copy_inputs(seed)
@@ -429,7 +429,7 @@ def test_kimi_k3_kda_decode_with_f_b_matches_reference(batch: int) -> None:
     assert torch.equal(reference_inputs.conv_state, actual_inputs.conv_state)
 
 
-def test_kimi_k3_kda_decode_with_f_b_recurrent_sequence() -> None:
+def test_kda_decode_with_f_b_recurrent_sequence() -> None:
     f_a, f_b_weight, seed = _make_fb_inputs(batch=2)
     reference_inputs = _copy_inputs(seed)
     actual_inputs = _copy_inputs(seed)
@@ -442,7 +442,7 @@ def test_kimi_k3_kda_decode_with_f_b_recurrent_sequence() -> None:
     assert torch.equal(reference_inputs.conv_state, actual_inputs.conv_state)
 
 
-def test_kimi_k3_kda_decode_with_f_b_graph_replay() -> None:
+def test_kda_decode_with_f_b_graph_replay() -> None:
     f_a, f_b_weight, inputs = _make_fb_inputs(batch=2)
     out = torch.empty((1, 2, _HEADS, _DIM), dtype=torch.bfloat16, device=_DEVICE)
     _run_with_f_b(f_a, f_b_weight, inputs)

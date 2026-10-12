@@ -6,7 +6,7 @@ Launch: torchrun --nproc_per_node=8 \\
 
 The combined [latent | shared] buffer is 3 rows of NORM_DIM per token; only
 the first num_tokens rows are normalized. Prints the crossover for
-SGLANG_ROCM_K3_FUSED_AR_RMSNORM_MAX_TOKENS.
+SGLANG_ROCM_FUSED_AR_RMSNORM_MAX_TOKENS.
 """
 
 from __future__ import annotations
@@ -90,7 +90,9 @@ def main() -> int:
     from sglang.srt.distributed.communication_op import (
         tensor_model_parallel_all_reduce,
     )
-    from sglang.srt.layers.communication.k3_fused_ar_rmsnorm import try_fused_ar_rmsnorm
+    from sglang.srt.layers.communication.hip_fused_ar_rmsnorm import (
+        try_fused_ar_rmsnorm,
+    )
     from sglang.srt.layers.layernorm import RMSNorm
 
     weight = torch.ones(NORM_DIM, dtype=torch.bfloat16, device=device)
@@ -161,7 +163,7 @@ def main() -> int:
         print("\nfused wins at tokens:", wins or "none")
         print("fused loses at tokens:", losses or "none")
         if wins and losses and min(losses) > min(wins):
-            print(f"suggested SGLANG_ROCM_K3_FUSED_AR_RMSNORM_MAX_TOKENS={max(wins)}")
+            print(f"suggested SGLANG_ROCM_FUSED_AR_RMSNORM_MAX_TOKENS={max(wins)}")
         elif not losses:
             print("no upper crossover in range; cap 0 (off) is correct")
     return 0

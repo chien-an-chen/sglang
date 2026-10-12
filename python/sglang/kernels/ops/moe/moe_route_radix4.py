@@ -145,10 +145,10 @@ def _empty_moe_buf(device: torch.device) -> torch.Tensor:
 
 def _register_presorted(aux: dict) -> None:
     try:
-        from aiter.fused_moe import register_k3_presorted_moe
+        from aiter.fused_moe import register_presorted_moe
     except Exception:
         return
-    register_k3_presorted_moe(aux)
+    register_presorted_moe(aux)
 
 
 def should_fuse_sort(n_tokens: int) -> bool:

@@ -11,10 +11,11 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
-from sglang.srt.utils.common import rank0_log
+from sglang.srt.utils.common import is_gfx95_supported, rank0_log
 
 _K = 128
 _LOWER_MIN = -5.0
@@ -289,4 +290,21 @@ class AiterFlashKDAKernel(LinearAttnKernelBase):
             return "indices"
         if prefix is not None and prefix.numel() != n:
             return "prefix"
+        return None
+
+
+def maybe_create_aiter_flash_kda_kernel() -> Optional["AiterFlashKDAKernel"]:
+    """gfx95 opt-in replacement for the Triton extend kernel, or None.
+
+    Decode and verify stay where the flags put them; an AITER import failure
+    leaves extend on Triton.
+    """
+    if not (envs.SGLANG_AITER_KDA_FLASH_PREFILL.get() and is_gfx95_supported()):
+        return None
+    try:
+        return AiterFlashKDAKernel()
+    except Exception as exc:
+        rank0_log(
+            f"AITER FlashKDA prefill unavailable ({exc}); KDA extend stays on Triton."
+        )
         return None

@@ -4,7 +4,7 @@
 Launch: torchrun --nproc_per_node=8 \\
   python/sglang/test/manual/kernels/bench_hip_ar_residual.py
 
-SGLANG_ROCM_K3_AR_RESIDUAL defaults on after this pair won (17.90 vs 17.01 us).
+SGLANG_ROCM_AR_RESIDUAL defaults on after this pair won (17.90 vs 17.01 us).
 """
 
 from __future__ import annotations

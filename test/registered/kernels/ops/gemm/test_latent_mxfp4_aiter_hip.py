@@ -6,6 +6,7 @@ from unittest.mock import patch
 import torch
 
 import sglang.srt.models.kimi_k3 as kimi_k3_model
+import sglang.srt.models.kimi_k3_rocm_moe as kimi_k3_rocm_moe
 from sglang.kernels.ops.gemm import latent_mxfp4_aiter_hip
 from sglang.srt.models.kimi_k3 import KimiK3MoE
 from sglang.test.ci.ci_register import register_amd_ci
@@ -70,16 +71,16 @@ class TestKimiK3LatentMXFP4(CustomTestCase):
         moe._front_down_scale4 = object()
         moe._latent_up_w4 = object()
         moe._latent_up_scale4 = object()
-        self.assertFalse(moe._use_moe_latent_mxfp4(2047))
-        self.assertTrue(moe._use_moe_latent_mxfp4(2048))
+        self.assertFalse(kimi_k3_rocm_moe.use_moe_latent_mxfp4(moe, 2047))
+        self.assertTrue(kimi_k3_rocm_moe.use_moe_latent_mxfp4(moe, 2048))
 
     def test_tuned_front_does_not_take_output_buffer_calls(self):
         x = torch.randn(48, 7168, dtype=torch.bfloat16, device=self.device)
         weight = torch.empty(6016, 7168, dtype=torch.bfloat16, device=self.device)
         expected = torch.randn(48, 6016, dtype=torch.bfloat16, device=self.device)
         with (
-            patch.object(kimi_k3_model, "_use_aiter", True),
-            patch.object(kimi_k3_model, "_k3_aiter_tuned_moe_front", True),
+            patch.object(kimi_k3_rocm_moe, "_use_aiter", True),
+            patch.object(kimi_k3_rocm_moe, "_aiter_tuned_moe_front", True),
             patch("aiter.tuned_gemm.tgemm.mm", return_value=expected) as tuned_mm,
         ):
             kimi_k3_model._k3_bf16_gemm(x[:47], weight)
@@ -99,8 +100,8 @@ class TestKimiK3LatentMXFP4(CustomTestCase):
         weight = torch.empty(4480, 7168, dtype=torch.bfloat16, device=self.device)
         expected = torch.randn(64, 4480, dtype=torch.bfloat16, device=self.device)
         with (
-            patch.object(kimi_k3_model, "_use_aiter", True),
-            patch.object(kimi_k3_model, "_k3_aiter_tuned_moe_front", True),
+            patch.object(kimi_k3_rocm_moe, "_use_aiter", True),
+            patch.object(kimi_k3_rocm_moe, "_aiter_tuned_moe_front", True),
             patch("aiter.tuned_gemm.tgemm.mm", return_value=expected) as tuned_mm,
         ):
             actual = kimi_k3_model._k3_bf16_gemm(x, weight)

@@ -200,24 +200,14 @@ class KDAKernelDispatcher:
                 "SM100, ptx_kda SM100 or SM103)."
             )
 
-        # gfx95 opt-in. Replaces the Triton extend kernel only; decode and
-        # verify stay where the flags put them. Import failure leaves Triton.
-        if (
-            prefill_backend.is_triton()
-            and envs.SGLANG_AITER_KDA_FLASH_PREFILL.get()
-            and is_gfx95_supported()
-        ):
-            try:
-                from sglang.srt.layers.attention.linear.kernels.kda_aiter_flash import (
-                    AiterFlashKDAKernel,
-                )
+        if is_hip() and prefill_backend.is_triton():
+            from sglang.srt.layers.attention.linear.kernels.kda_aiter_flash import (
+                maybe_create_aiter_flash_kda_kernel,
+            )
 
-                self.extend_kernel = AiterFlashKDAKernel()
-            except Exception as exc:
-                rank0_log(
-                    "AITER FlashKDA prefill unavailable "
-                    f"({exc}); KDA extend stays on Triton."
-                )
+            self.extend_kernel = (
+                maybe_create_aiter_flash_kda_kernel() or self.extend_kernel
+            )
 
         self.supports_packed_decode = getattr(
             self.decode_kernel, "supports_packed_decode", False
@@ -420,9 +410,6 @@ class KDAAttnBackend(MambaAttnBackendBase):
     # force-flush path.
     needs_cpu_seq_lens: bool = False
 
-    # One-shot log guard for the HIP fused-KDA rejection diagnostic.
-    _hip_fused_reject_logged: bool = False
-
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
         # Needed by the extra_buffer track path: _init_track_conv_indices reads
@@ -451,8 +438,6 @@ class KDAAttnBackend(MambaAttnBackendBase):
         self.kernel_dispatcher = KDAKernelDispatcher(
             decode_backend, prefill_backend, verify_backend
         )
-        # Set for one extend when K3 leaves beta as logits for FlashKDA.
-        self._k3_kda_beta_is_raw = False
         # One-shot; emitted at the first fused-decode interception below.
         self._fused_override_notice = (
             "K3 fused KDA decode engaged: --linear-attn-decode-backend "
@@ -941,9 +926,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             A_log=layer.A_log,
             dt_bias=layer.dt_bias,
             lower_bound=layer.lower_bound,
-            # gate_was_flat is the decode-layout signal. K3 FlashKDA prefill
-            # additionally leaves beta as logits (see KimiK3Attention.forward).
-            beta_is_raw=gate_was_flat or self._k3_kda_beta_is_raw,
+            beta_is_raw=gate_was_flat or layer.extend_beta_is_raw,
             extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
             extend_prefix_lens=forward_batch.extend_prefix_lens,
             layer_id=layer.layer_id,

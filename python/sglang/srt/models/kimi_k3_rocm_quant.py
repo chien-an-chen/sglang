@@ -18,6 +18,7 @@ AITER kernels want. The conversions live here; ``kimi_k3.py`` calls every entry
 point behind ``_is_hip`` and keeps the checkpoint's own layout otherwise.
 """
 
+from types import SimpleNamespace
 from typing import Optional
 
 import torch
@@ -47,6 +48,45 @@ def _k3_channel_fp8_to_bf16(module: nn.Module, weight: torch.Tensor) -> torch.Te
         weight_scale = weight_scale.view(-1, 1)
     return (weight.to(torch.float32) * weight_scale.to(torch.float32)).to(
         torch.bfloat16
+    )
+
+
+def _k3_channel_fp8_to_tensor_fp8(
+    module: nn.Module, weight: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Requantize a per-output-channel FP8 weight to (per-tensor FP8, scalar
+    scale) for the aiter absorb GEMM. Must run before the kv_b head split."""
+    from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
+    from sglang.srt.layers.quantization.fp8_utils import (
+        channel_quant_to_tensor_quant,
+        normalize_e4m3fn_to_e4m3fnuz,
+    )
+
+    weight_scale = module.weight_scale
+    if is_fp8_fnuz():
+        weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
+            weight=weight, weight_scale=weight_scale, input_scale=None
+        )
+    if weight_scale.dim() == 1:
+        weight_scale = weight_scale.view(-1, 1)
+    return channel_quant_to_tensor_quant(weight, weight_scale)
+
+
+def _k3_is_raw_quark_channel_fp8(module: nn.Module) -> bool:
+    """Quark per-channel FP8 with dynamic activations, not yet post-processed."""
+    from sglang.srt.layers.quantization.quark.schemes import QuarkW8A8Fp8
+
+    scheme = getattr(module, "scheme", None)
+    weight = module.weight
+    scale = getattr(module, "weight_scale", None)
+    return (
+        isinstance(scheme, QuarkW8A8Fp8)
+        and scheme.weight_qscheme == "per_channel"
+        and not scheme.is_static_input_scheme
+        and weight.dim() == 2
+        and weight.dtype == torch.float8_e4m3fn
+        and isinstance(scale, torch.Tensor)
+        and scale.numel() == weight.shape[0]
     )
 
 
@@ -82,6 +122,51 @@ def _k3_kda_inproj_channel_fp8_scales(
 
 
 def _k3_merge_kda_inproj_fp8(self_attn: nn.Module) -> bool:
+    """Merge Quark FP8 [q,k,v,g | f_a | b] into one per-channel FP8 linear.
+
+    Runs before process_weights_after_loading, so the weights are still [out, in]
+    with an [out] scale. The merged copy serves decode up to the token limit;
+    the original linears stay for larger batches. With SGLANG_ROCM_K3_PTPC_FP8
+    the prequantized PTPC pack is tried first.
+    """
+    if _k3_merge_kda_inproj_ptpc_fp8(self_attn):
+        return True
+    if not (envs.SGLANG_ROCM_K3_FUSE_KDA_INPROJ.get() and self_attn.use_full_rank_gate):
+        return False
+    mods = (self_attn.fused_qkvg_proj, self_attn.f_a_proj, self_attn.b_proj)
+    if not all(_k3_is_raw_quark_channel_fp8(m) for m in (*mods, self_attn.f_b_proj)):
+        return False
+    weights = [m.weight.data for m in mods]
+    if len({w.shape[1] for w in weights}) != 1:
+        return False
+    scales = [m.weight_scale.data.reshape(-1).float() for m in mods]
+    sizes = [w.shape[0] for w in weights]
+    # N % 64 == 0 keeps aiter's preshuffled FP8 GEMM (use_aiter_bpreshuffle_gemm).
+    pad = (-sum(sizes)) % 64
+    if pad:
+        weights.append(weights[0].new_zeros((pad, weights[0].shape[1])))
+        scales.append(scales[0].new_ones(pad))
+    scheme = self_attn.fused_qkvg_proj.scheme
+    layer = SimpleNamespace(
+        weight=torch.cat(weights).contiguous(),
+        weight_scale=torch.cat(scales),
+        input_scale=None,
+        scheme=scheme,
+    )
+    scheme.process_weights_after_loading(layer)
+
+    self_attn._qkvgbfa_layer = layer
+    self_attn._bfa_fa_size, self_attn._bfa_b_size = sizes[1], sizes[2]
+    self_attn._qkvgbfa_sizes = [*self_attn.split_sizes, sizes[1], sizes[2], pad]
+    # f_b is [heads * head_dim, head_dim]; BF16 lets it use the tiny GEMM and
+    # the fused KDA decode.
+    self_attn._bfa_f_b_w = _k3_channel_fp8_to_bf16(
+        self_attn.f_b_proj, self_attn.f_b_proj.weight.data
+    ).contiguous()
+    return True
+
+
+def _k3_merge_kda_inproj_ptpc_fp8(self_attn: nn.Module) -> bool:
     """Merge the per-channel FP8 KDA input projections into one PTPC GEMM."""
     scales = _k3_kda_inproj_channel_fp8_scales(self_attn)
     if scales is None:
@@ -160,7 +245,9 @@ def _k3_prepare_f_b_tiny_gemm(self_attn: nn.Module) -> None:
 
 def _k3_qkvgbfa_inproj(self_attn: nn.Module, hidden_states) -> Optional[torch.Tensor]:
     """Run the merged [q,k,v,g | f_a | b] projection, or None if uncovered."""
-    if self_attn._use_qkvgbfa_ptpc_fp8(hidden_states):
+    from sglang.srt.models.kimi_k3_rocm_kda import use_qkvgbfa_ptpc_fp8
+
+    if use_qkvgbfa_ptpc_fp8(self_attn, hidden_states):
         from sglang.kernels.ops.gemm import ptpc_fp8_aiter_hip
 
         if isinstance(hidden_states, tuple):
@@ -211,7 +298,7 @@ def k3_prepare_front_down_fp8(mlp: nn.Module) -> None:
     """
     if not envs.SGLANG_ROCM_K3_MOE_LATENT_FP8.get() or not mlp.use_latent_moe:
         return
-    if not (mlp._eligible_for_fused_front or mlp._eligible_for_partial_fused_front):
+    if not (mlp._eligible_for_fused_front or mlp._partial_fused_front):
         return
     if mlp._front_sizes is None or len(mlp._front_sizes) not in (2, 3):
         return
@@ -273,27 +360,19 @@ def k3_run_front_down_fp8(
     )
 
 
-def k3_densify_quark_shared_experts(mlp: nn.Module) -> None:
-    """Dequantize Quark MXFP4 shared experts before the MoE front merge.
+def _k3_densify_quark_shared_experts(mlp: nn.Module) -> None:
+    """Dequantize Quark MXFP4 shared experts to BF16 before the MoE front merge.
 
-    With ``SGLANG_ROCM_QUARK_MXFP4_LINEAR_ACT=bf16`` Quark turns these linears
-    into dense BF16 in ``process_weights_after_loading``, which the loader only
-    runs after ``load_weights`` has already merged the front. Doing the same
-    dequant here lets the shared gate_up join the full fused front and the
-    shared down take the PTPC FP8 decode path, as with the official
-    checkpoint. The later loader pass is then a no-op on these layers.
+    With the default bf16 SGLANG_ROCM_QUARK_MXFP4_LINEAR_ACT, Quark dequantizes
+    them anyway, but only after load_weights has merged the front. Doing it
+    here lets them join the fused front; the later loader pass is a no-op.
     """
     from sglang.srt.layers.quantization.quark.schemes import quark_w4a4_mxfp4
 
-    if not quark_w4a4_mxfp4._dequant_linear_to_bf16:
-        return
     shared = getattr(mlp, "shared_experts", None)
-    if shared is None:
+    if shared is None or not quark_w4a4_mxfp4._dequant_linear_to_bf16:
         return
     for linear in (shared.gate_up_proj, shared.down_proj):
         scheme = getattr(linear, "scheme", None)
-        if not isinstance(scheme, quark_w4a4_mxfp4.QuarkW4A4MXFP4) or getattr(
-            linear, "dequantized_bf16", False
-        ):
-            continue
-        scheme.process_weights_after_loading(linear)
+        if isinstance(scheme, quark_w4a4_mxfp4.QuarkW4A4MXFP4):
+            scheme.process_weights_after_loading(linear)

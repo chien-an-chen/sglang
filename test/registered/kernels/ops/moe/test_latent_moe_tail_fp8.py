@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import inspect
+
 import pytest
 import torch
 from aiter.jit.utils.chip_info import get_gfx_runtime
@@ -187,6 +189,23 @@ def test_latent_moe_tail_fp8_skip_rms_uses_pre_normalized_hidden():
         skip_rms=False,
     )
     assert not torch.equal(actual, double_normed)
+
+
+def test_skip_rms_is_plumbed_through_the_latent_tail_adapters():
+    from sglang.kernels.ops.moe.kimi_k3_flydsl.kernels.latent_moe_tail_fp8_gfx950 import (
+        build_latent_moe_tail_fp8_persistent_module,
+    )
+    from sglang.kernels.ops.moe.kimi_k3_flydsl.latent_moe_tail_fp8 import (
+        latent_moe_tail_fp8,
+    )
+    from sglang.kernels.ops.moe.latent_tail_aiter_hip import run
+
+    assert (
+        "skip_rms"
+        in inspect.signature(build_latent_moe_tail_fp8_persistent_module).parameters
+    )
+    assert "skip_rms" in inspect.signature(latent_moe_tail_fp8).parameters
+    assert "skip_rms" in inspect.signature(run).parameters
 
 
 if __name__ == "__main__":

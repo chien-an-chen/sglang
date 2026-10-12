@@ -936,11 +936,30 @@ class Envs:
     # Enable dual-stream MoE (shared experts vs routed experts) on the
     # ROCm/AITER path. Requires GPU_MAX_HW_QUEUES>=5 to avoid HW-queue serialization.
     SGLANG_ROCM_USE_MULTI_STREAM = EnvBool(False)
+    # Fuse an all-reduce with the RMSNorm after it via AITER's 2-stage kernel.
+    # Only applies in the 2-stage AR regime (>= 80 KiB on TP8); smaller sizes
+    # stay on split AR + RMSNorm.
+    SGLANG_ROCM_FUSED_AR_RMSNORM = EnvBool(True)
+    # Upper token bound for the fused AR+RMSNorm above; 0 disables the cap.
+    # Measured on MI355X TP8 Kimi-K3 (bench_fused_ar_rmsnorm.py): fused wins by
+    # 5.3% at 8 tokens, 2.5% at 24, then loses 2.8% at 32 and 13% at 96.
+    SGLANG_ROCM_FUSED_AR_RMSNORM_MAX_TOKENS = EnvInt(24)
+    # Fold a pending residual add into AITER custom all-reduce. M in {1,2,4}
+    # uses 1-stage; M=8 uses a 2-stage residual epilogue that folds the add
+    # into all-gather. Set MAX_TOKENS=4 to keep it on 1-stage sizes only.
+    SGLANG_ROCM_AR_RESIDUAL = EnvBool(True)
+    SGLANG_ROCM_AR_RESIDUAL_MAX_TOKENS = EnvInt(8)
     # Fold the Kimi-K3 KDA [f_a|b] tail into the wide [q,k,v,g] projection.
     # The merged N=6288 shape is used only up to MAX_TOKENS below, where decode
     # is bandwidth bound; larger batches keep the tuned N=6144 split path.
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ = EnvBool(True)
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ_MAX_TOKENS = EnvInt(256)
+    # Fused AITER KDA decode. Empty keeps the unfused chain; "aiter" selects
+    # the gfx950 FlyDSL kernel.
+    SGLANG_ROCM_K3_KDA_FUSED_BACKEND = EnvStr("")
+    # Requantize Quark per-channel FP8 kv_b to per-tensor FP8 so the MLA absorb
+    # BMMs run the AITER a8w8 kernel (~2.3% weight error vs dequant to bf16).
+    SGLANG_ROCM_K3_MLA_ABSORB_FP8 = EnvBool(True)
     # gfx95 KDA extend via AITER FlashKDA. The model keeps beta as logits and
     # the kernel sigmoids them. Off by default: tracked interior snapshots and
     # speculative draft-extend stay on Triton either way.
@@ -950,6 +969,10 @@ class Envs:
     # at load. bf16 by default: K3 GSM8K scores 0.947 vs fp4's 0.908, for
     # ~3% decode throughput. Ignored off ROCm (both paths are aiter kernels).
     SGLANG_ROCM_QUARK_MXFP4_LINEAR_ACT = EnvStr("bf16")
+    # Dequantize Quark MXFP4 shared experts before the MoE front merge so they
+    # join it. Needs SGLANG_ROCM_QUARK_MXFP4_LINEAR_ACT=bf16. Shared down stays
+    # BF16: PTPC on that dequantized weight scored GSM8K 0.937.
+    SGLANG_ROCM_K3_QUARK_SHARED_FULL_FRONT = EnvBool(True)
     # ROCm decode attention kernel: auto (aiter_sparse on gfx950, tilelang elsewhere) |
     # aiter_sparse | tilelang | triton | torch | comparison | unified_kv_triton
     SGLANG_HACK_FLASHMLA_BACKEND = EnvStr("auto")
@@ -1840,24 +1863,11 @@ class Envs:
     # CustomAllReduceV2 with multicast is available; set 0/1 to override in
     # either direction. See srt/layers/communication/k3_ar_fusion.py.
     SGLANG_K3_AR_FUSION = EnvBool(False)
-    # HIP: fuse the K3 latent all-reduce with RMSNorm via AITER's 2-stage
-    # kernel. Only applies when the combined buffer is already in the 2-stage
-    # AR regime (>= 80 KiB on TP8); smaller sizes stay on split AR + RMSNorm.
-    SGLANG_ROCM_K3_FUSED_AR_RMSNORM = EnvBool(True)
-    # Upper token bound for the fused AR+RMSNorm above; 0 disables the cap.
-    # Measured on MI355X TP8 (bench_fused_ar_rmsnorm.py): fused wins by 5.3% at
-    # 8 tokens, 2.5% at 24, then loses 2.8% at 32 and 13% at 96.
-    SGLANG_ROCM_K3_FUSED_AR_RMSNORM_MAX_TOKENS = EnvInt(24)
     # HIP: when the fused-front [latent | shared] buffer is larger than the
     # quick-reduce IPC cap, all-reduce the two slices separately instead of
     # one NCCL Generic. Keeps ROCM_QUICK_REDUCE_MAX_SIZE_BYTES_MB=256 (16K
     # scratch). Decode-sized concatenations stay on a single collective.
     SGLANG_ROCM_K3_SPLIT_OVERSIZED_MOE_AR = EnvBool(True)
-    # HIP: fold the K3 attn-res prefix add into AITER custom all-reduce.
-    # M in {1,2,4} uses 1-stage; M=8 uses a 2-stage residual epilogue that
-    # folds the add into all-gather. Set MAX_TOKENS=4 for the old policy.
-    SGLANG_ROCM_K3_AR_RESIDUAL = EnvBool(True)
-    SGLANG_ROCM_K3_AR_RESIDUAL_MAX_TOKENS = EnvInt(8)
     # K3 SP-MoE fused residual + reduce-scatter and matching all-gather over
     # CustomAllReduceV2's MNNVL push workspace. Auto-probed for checked-in
     # TP4/TP8 GB300 and TP16 GB200/GB300 tuning; set 0/1 to override. See
@@ -1912,10 +1922,6 @@ class Envs:
     # [3584 -> 7168] and 1.4x on shared down [768 -> 7168] on MI355X.
     SGLANG_ROCM_K3_PTPC_FP8_PREFILL_MIN_TOKENS = EnvInt(0)
     SGLANG_ROCM_K3_PTPC_FP8_SHARED_DOWN = EnvBool(False)
-    # Dequantize Quark MXFP4 shared experts before the MoE front merge so they
-    # join the full fused front and the PTPC shared-down path (needs
-    # SGLANG_ROCM_QUARK_MXFP4_LINEAR_ACT=bf16).
-    SGLANG_ROCM_K3_QUARK_SHARED_FULL_FRONT = EnvBool(False)
     # Below this batch the projections are launch-latency bound, so the extra
     # activation-quant launch costs more than the halved weight traffic saves.
     SGLANG_ROCM_K3_PTPC_FP8_MIN_TOKENS = EnvInt(8)
@@ -1938,7 +1944,9 @@ class Envs:
     SGLANG_ROCM_K3_ONLINE_FP8_SHARED_EXPERTS = EnvBool(False)
     # Master switch for the ROCm AITER K3 decode path: the MXFP4 SiTU MoE
     # runner, the fused MoE front and the AITER-backed attention projections.
-    SGLANG_ROCM_K3_AITER_OPT = EnvBool(False)
+    SGLANG_ROCM_K3_AITER_OPT = EnvBoolWithAlias(
+        False, deprecated_name="SGLANG_AITER_K3_OPT"
+    )
     # Per-operator opt-ins for the gfx950 FlyDSL specializations. Each one
     # fail-closes to the split GEMM chain when the chip, shape or AITER build
     # cannot service it, so enabling one on unsupported hardware is a no-op.
@@ -1961,9 +1969,6 @@ class Envs:
     # Where the K3 FlyDSL kernels come from: "auto" prefers the SGLang copy and
     # falls back to AITER, "sglang" and "aiter" pin one source.
     SGLANG_ROCM_K3_FLYDSL_SOURCE = EnvStr("auto")
-    # Set to "aiter" to defer the KDA f_b projection into AITER's fused gfx950
-    # decode kernel instead of running it as a separate GEMM.
-    SGLANG_ROCM_K3_KDA_FUSED_BACKEND = EnvStr("")
     # Restore the pre-tuning (rows_per_wave, weight_cache_modifier) pair for
     # the KDA group64 projection so the per-bucket tuning can be A/B'd.
     SGLANG_ROCM_K3_KDA_GROUP64_LEGACY_LAUNCH = EnvBool(False)
